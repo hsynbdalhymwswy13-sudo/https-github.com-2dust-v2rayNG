@@ -1,5 +1,7 @@
 package com.v2ray.ang.ui.perappproxy
 
+import android.content.Intent
+import android.content.res.Configuration
 import android.os.Bundle
 import androidx.activity.viewModels
 import androidx.annotation.StringRes
@@ -53,7 +55,7 @@ import com.v2ray.ang.ui.compose.NavigationBarsBottomPadding
 import com.v2ray.ang.ui.compose.verticalScrollbar
 import com.v2ray.ang.util.Utils
 
-private enum class PerAppMenuAction(@StringRes val labelRes: Int) {
+internal enum class PerAppMenuAction(@StringRes val labelRes: Int) {
     SelectAll(R.string.menu_item_select_all),
     InvertSelection(R.string.menu_item_invert_selection),
     SelectProxyApps(R.string.menu_item_select_proxy_app),
@@ -61,52 +63,84 @@ private enum class PerAppMenuAction(@StringRes val labelRes: Int) {
     ExportSelection(R.string.menu_item_export_proxy_app)
 }
 
-class PerAppProxyActivity : BaseComponentActivity() {
+class PerAppProxyActivity : BasePerAppProxyActivity() {
+    override fun televisionDestination(): Intent? {
+        val uiMode = resources.configuration.uiMode and Configuration.UI_MODE_TYPE_MASK
+        return if (uiMode == Configuration.UI_MODE_TYPE_TELEVISION) Intent(this, TvPerAppProxyActivity::class.java) else null
+    }
+
+    @Composable
+    override fun PerAppContent(state: PerAppProxyState, actions: PerAppProxyActions) {
+        PerAppProxyScreen(
+            state.apps, state.isLoading, state.blacklist, state.enabled, state.bypassApps,
+            actions.onBack, actions.onEnabledChanged, actions.onBypassChanged, actions.onToggleApp, actions.onSearch, actions.onMenuAction
+        )
+    }
+}
+
+internal data class PerAppProxyState(
+    val apps: List<AppInfo>, val isLoading: Boolean, val blacklist: Set<String>, val enabled: Boolean, val bypassApps: Boolean
+)
+
+internal class PerAppProxyActions(
+    val onBack: () -> Unit, val onEnabledChanged: (Boolean) -> Unit, val onBypassChanged: (Boolean) -> Unit,
+    val onToggleApp: (String) -> Unit, val onSearch: (String) -> Unit, val onMenuAction: (PerAppMenuAction) -> Unit
+)
+
+abstract class BasePerAppProxyActivity : BaseComponentActivity() {
 
     private val viewModel: PerAppProxyViewModel by viewModels()
+    private var forwardingToTv = false
+
+    protected open fun televisionDestination(): Intent? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        val destination = televisionDestination()
+        forwardingToTv = destination != null
         super.onCreate(savedInstanceState)
+        if (destination != null) {
+            startActivity(destination)
+            finish()
+            return
+        }
         viewModel.loadApps(this)
     }
 
     @Composable
-    override fun ScreenContent() {
+    final override fun ScreenContent() {
+        if (forwardingToTv) return
         val apps by viewModel.displayedApps.collectAsStateWithLifecycle()
         val isLoading by viewModel.isLoading.collectAsStateWithLifecycle()
         val blacklist by viewModel.blacklist.collectAsStateWithLifecycle()
         val perAppProxyEnabled by viewModel.perAppProxyEnabled.collectAsStateWithLifecycle()
         val bypassApps by viewModel.bypassApps.collectAsStateWithLifecycle()
 
-        PerAppProxyScreen(
-            apps = apps,
-            isLoading = isLoading,
-            blacklist = blacklist,
-            perAppProxyEnabled = perAppProxyEnabled,
-            bypassApps = bypassApps,
-            onBackClick = { finish() },
-            onPerAppProxyChanged = { viewModel.setPerAppProxyEnabled(it) },
-            onBypassAppsChanged = { viewModel.setBypassAppsEnabled(it) },
-            onToggleApp = { viewModel.toggle(it) },
-            onSearch = { viewModel.filterApps(it) },
-            onSelectAll = { viewModel.selectAll() },
-            onInvertSelection = { viewModel.invertSelection() },
-            onSelectProxyAuto = { viewModel.selectProxyAppAuto(this) },
-            onImportProxyApp = {
-                val content = Utils.getClipboard(applicationContext)
-                viewModel.importProxyApp(content, this)
-            },
-            onExportProxyApp = {
-                val export = viewModel.exportProxyApp()
-                Utils.setClipboard(applicationContext, export)
+        val actions = remember {
+            PerAppProxyActions(::finish, viewModel::setPerAppProxyEnabled, viewModel::setBypassAppsEnabled,
+                viewModel::toggle, viewModel::filterApps, ::handleMenuAction)
+        }
+        PerAppContent(PerAppProxyState(apps, isLoading, blacklist, perAppProxyEnabled, bypassApps), actions)
+    }
+
+    @Composable
+    internal abstract fun PerAppContent(state: PerAppProxyState, actions: PerAppProxyActions)
+
+    private fun handleMenuAction(action: PerAppMenuAction) {
+        when (action) {
+            PerAppMenuAction.SelectAll -> viewModel.selectAll()
+            PerAppMenuAction.InvertSelection -> viewModel.invertSelection()
+            PerAppMenuAction.SelectProxyApps -> viewModel.selectProxyAppAuto(this)
+            PerAppMenuAction.ImportSelection -> viewModel.importProxyApp(Utils.getClipboard(applicationContext), this)
+            PerAppMenuAction.ExportSelection -> {
+                Utils.setClipboard(applicationContext, viewModel.exportProxyApp())
                 toastSuccess(R.string.toast_success)
             }
-        )
+        }
     }
 }
 
 @Composable
-fun PerAppProxyScreen(
+private fun PerAppProxyScreen(
     apps: List<AppInfo>,
     isLoading: Boolean,
     blacklist: Set<String>,
@@ -117,11 +151,7 @@ fun PerAppProxyScreen(
     onBypassAppsChanged: (Boolean) -> Unit,
     onToggleApp: (String) -> Unit,
     onSearch: (String) -> Unit,
-    onSelectAll: () -> Unit,
-    onInvertSelection: () -> Unit,
-    onSelectProxyAuto: () -> Unit,
-    onImportProxyApp: () -> Unit,
-    onExportProxyApp: () -> Unit
+    onMenuAction: (PerAppMenuAction) -> Unit
 ) {
     var showSearch by rememberSaveable { mutableStateOf(false) }
     var searchQuery by rememberSaveable { mutableStateOf("") }
@@ -176,13 +206,7 @@ fun PerAppProxyScreen(
                         ) {
                             AppDropdownMenuItems(PerAppMenuAction.entries, { it.labelRes }) { action ->
                                 showMenu = false
-                                when (action) {
-                                    PerAppMenuAction.SelectAll -> onSelectAll()
-                                    PerAppMenuAction.InvertSelection -> onInvertSelection()
-                                    PerAppMenuAction.SelectProxyApps -> onSelectProxyAuto()
-                                    PerAppMenuAction.ImportSelection -> onImportProxyApp()
-                                    PerAppMenuAction.ExportSelection -> onExportProxyApp()
-                                }
+                                onMenuAction(action)
                             }
                         }
                     }

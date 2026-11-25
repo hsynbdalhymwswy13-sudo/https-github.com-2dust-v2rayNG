@@ -157,20 +157,13 @@ object HttpUtil {
 
         // Store origin
         val originalUrl = requireNotNull(request.url).toHttpUrl()
-        val headersMap = JsonUtil.parseHeadersToMap(request.requestHeaders)
 
         while (redirects++ < maxRedirects) {
             if (currentUrl == null) continue
             val client = buildOkHttpClient(request.timeout, request.httpPort, request.proxyUsername, request.proxyPassword, followRedirects = false)
-            val finalUserAgent = if (request.userAgent.isNullOrBlank()) {
-                "v2rayNG/${BuildConfig.VERSION_NAME}"
-            } else {
-                request.userAgent
-            }
             val requestBuilder = Request.Builder()
                 .url(currentUrl)
                 .get()
-                .header("User-agent", finalUserAgent)
                 .header("Connection", "close")
 
             val targetUrl = currentUrl.toHttpUrl()
@@ -179,15 +172,16 @@ object HttpUtil {
                 targetUrl.host == originalUrl.host &&
                 targetUrl.port == originalUrl.port
 
-            if (sameOrigin) {
-                applyEmbeddedBasicAuthHeader(currentUrl, requestBuilder)
-
-                for ((key, value) in headersMap) {
-                    LogUtil.d(AppConfig.TAG, "Adding custom header: $key")
-                    try {
-                        requestBuilder.header(key, value)
-                    } catch (_: IllegalArgumentException) {
-                    }
+            val headerRequest = if (sameOrigin) {
+                request.copy(url = currentUrl)
+            } else {
+                request.copy(url = null, requestHeaders = null)
+            }
+            for ((key, value) in buildRequestHeaders(headerRequest, includeDefaultUserAgent = true)) {
+                LogUtil.d(AppConfig.TAG, "Adding request header: $key")
+                try {
+                    requestBuilder.header(key, value)
+                } catch (_: IllegalArgumentException) {
                 }
             }
             client.newCall(requestBuilder.build()).execute().use { response ->
@@ -223,9 +217,23 @@ object HttpUtil {
         throw IOException("Too many redirects")
     }
 
-    private fun applyEmbeddedBasicAuthHeader(rawUrl: String, requestBuilder: Request.Builder) {
-        val parsed = runCatching { URL(rawUrl) }.getOrNull() ?: return
-        parsed.userInfo?.let { userInfo ->
+    internal fun buildRequestHeaders(
+        request: UrlContentRequest,
+        includeDefaultUserAgent: Boolean,
+    ): Map<String, String> {
+        val headers = linkedMapOf<String, String>()
+        fun setHeader(key: String, value: String) {
+            headers.keys.firstOrNull { it.equals(key, ignoreCase = true) }?.let(headers::remove)
+            headers[key] = value
+        }
+        val userAgent = request.userAgent?.takeUnless { it.isBlank() }
+            ?: if (includeDefaultUserAgent) "v2rayNG/${BuildConfig.VERSION_NAME}" else null
+        if (userAgent != null) {
+            setHeader("User-Agent", userAgent)
+        }
+
+        val parsed = request.url?.let { runCatching { URL(it) }.getOrNull() }
+        parsed?.userInfo?.let { userInfo ->
             val colon = userInfo.indexOf(':')
             val user = runCatching {
                 Utils.decodeURIComponent(if (colon >= 0) userInfo.substring(0, colon) else userInfo)
@@ -233,8 +241,11 @@ object HttpUtil {
             val pass = runCatching {
                 Utils.decodeURIComponent(if (colon >= 0) userInfo.substring(colon + 1) else "")
             }.getOrDefault(if (colon >= 0) userInfo.substring(colon + 1) else "")
-            requestBuilder.header("Authorization", Credentials.basic(user, pass))
+            setHeader("Authorization", Credentials.basic(user, pass))
         }
+
+        JsonUtil.parseHeadersToMap(request.requestHeaders).forEach(::setHeader)
+        return headers
     }
 
     private fun buildOkHttpClient(
@@ -303,19 +314,29 @@ object HttpUtil {
 
         return try {
             client.newCall(requestBuilder.build()).execute().use { response ->
-                if (!response.isSuccessful) {
+                if (!response.isSuccessful || response.code == 206) {
                     LogUtil.w(AppConfig.TAG, "Failed to download file, code=${response.code}, url=$url")
                     return false
                 }
-                val body = response.body ?: return false
-                body.byteStream().use { input ->
+                val body = response.body
+                val expectedLength = body.contentLength()
+                val receivedLength = body.byteStream().use { input ->
                     targetFile.outputStream().use { output ->
                         input.copyTo(output)
                     }
                 }
+                if (expectedLength >= 0L && receivedLength != expectedLength) {
+                    targetFile.delete()
+                    LogUtil.w(
+                        AppConfig.TAG,
+                        "Incomplete download: expected=$expectedLength, received=$receivedLength"
+                    )
+                    return false
+                }
                 true
             }
         } catch (e: Exception) {
+            targetFile.delete()
             LogUtil.e(AppConfig.TAG, "Failed to download file: $url", e)
             false
         }

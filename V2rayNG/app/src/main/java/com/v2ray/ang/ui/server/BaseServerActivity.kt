@@ -1,5 +1,6 @@
 package com.v2ray.ang.ui.server
 
+import android.content.res.Configuration
 import android.os.Bundle
 import android.view.WindowManager.LayoutParams
 import androidx.compose.foundation.layout.Arrangement
@@ -49,6 +50,7 @@ import com.v2ray.ang.ui.compose.FormTextField
 import com.v2ray.ang.ui.compose.LocalEditorFocus
 import com.v2ray.ang.ui.compose.NavigationBarsSpacer
 import com.v2ray.ang.ui.compose.SettingsSwitchItem
+import com.v2ray.ang.ui.compose.editorFocusTarget
 import com.v2ray.ang.ui.compose.rememberEditorFocus
 import com.v2ray.ang.ui.compose.verticalScrollbar
 import com.v2ray.ang.util.JsonUtil
@@ -70,8 +72,10 @@ abstract class BaseServerActivity : BaseComponentActivity() {
     protected val subscriptionId by lazy { intent.getStringExtra("subscriptionId") }
 
     protected lateinit var initialConfig: ProfileItem
+    private var isTelevision = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        isTelevision = resources.configuration.uiMode and Configuration.UI_MODE_TYPE_MASK == Configuration.UI_MODE_TYPE_TELEVISION
         super.onCreate(savedInstanceState)
         if (savedInstanceState != null) {
             // The previous window's IME state is not valid until the new editor has focus.
@@ -359,7 +363,7 @@ abstract class BaseServerActivity : BaseComponentActivity() {
                         }
                     },
                     enabled = !state.isFetchingCert,
-                    modifier = Modifier.padding(start = 16.dp).then(LocalEditorFocus.current?.target() ?: Modifier)
+                    modifier = Modifier.padding(start = 16.dp).editorFocusTarget()
                 ) {
                     Text(stringResource(R.string.pinned_ca256_action_fetch))
                 }
@@ -464,6 +468,35 @@ abstract class BaseServerActivity : BaseComponentActivity() {
         content: @Composable ColumnScope.() -> Unit
     ) {
         var showDeleteDialog by rememberSaveable { mutableStateOf(false) }
+        if (isTelevision) {
+            TvServerEditor(
+                title, onBack = ::finish, onSave = onSaveClick,
+                onDelete = if (editGuid.isNotEmpty() && !isRunning) ({ showDeleteDialog = true }) else null,
+                content = content
+            )
+        } else {
+            PhoneServerEditor(title, onSaveClick, { showDeleteDialog = true }, content)
+        }
+        if (showDeleteDialog) {
+            DeleteConfirmDialog(
+                message = stringResource(R.string.confirm_delete_profile),
+                itemName = initialConfig.remarks,
+                onConfirm = {
+                    showDeleteDialog = false
+                    deleteServer(editGuid)
+                },
+                onDismiss = { showDeleteDialog = false }
+            )
+        }
+    }
+
+    @Composable
+    private fun PhoneServerEditor(
+        title: String,
+        onSaveClick: () -> Unit,
+        onDeleteClick: () -> Unit,
+        content: @Composable ColumnScope.() -> Unit
+    ) {
         val scrollState = rememberScrollState()
         val focus = rememberEditorFocus()
         Scaffold(
@@ -479,7 +512,7 @@ abstract class BaseServerActivity : BaseComponentActivity() {
                     },
                     actions = {
                         if (editGuid.isNotEmpty() && !isRunning) {
-                            IconButton(onClick = { showDeleteDialog = true }, modifier = focus.target()) {
+                            IconButton(onClick = onDeleteClick, modifier = focus.target()) {
                                 Icon(
                                     painterResource(R.drawable.ic_delete_24dp),
                                     stringResource(R.string.acc_delete)
@@ -510,17 +543,6 @@ abstract class BaseServerActivity : BaseComponentActivity() {
                 CompositionLocalProvider(LocalEditorFocus provides focus) { content() }
                 NavigationBarsSpacer()
             }
-        }
-        if (showDeleteDialog) {
-            DeleteConfirmDialog(
-                message = stringResource(R.string.confirm_delete_profile),
-                itemName = initialConfig.remarks,
-                onConfirm = {
-                    showDeleteDialog = false
-                    deleteServer(editGuid)
-                },
-                onDismiss = { showDeleteDialog = false }
-            )
         }
     }
 

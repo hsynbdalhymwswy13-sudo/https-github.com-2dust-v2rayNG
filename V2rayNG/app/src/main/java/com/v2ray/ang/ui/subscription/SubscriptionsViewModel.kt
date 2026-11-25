@@ -7,8 +7,7 @@ import com.v2ray.ang.AppConfig
 import com.v2ray.ang.R
 import com.v2ray.ang.dto.SubscriptionUpdateMessage
 import com.v2ray.ang.dto.entities.SubscriptionCache
-import com.v2ray.ang.dto.entities.SubscriptionItem
-import com.v2ray.ang.extension.moveItem
+import com.v2ray.ang.extension.moveGuid
 import com.v2ray.ang.handler.AngConfigManager
 import com.v2ray.ang.handler.MmkvManager
 import com.v2ray.ang.handler.SettingsChangeManager
@@ -21,46 +20,67 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+
+internal data class SubscriptionListState(
+    val groups: List<SubscriptionCache>? = null,
+    val updateOptions: Set<SubscriptionUpdateOption> = emptySet(),
+    val confirmRemove: Boolean = false
+)
 
 class SubscriptionsViewModel(application: Application) : BaseViewModel(application) {
     private var qrCodeJob: Job? = null
     private val _qrCode = MutableStateFlow<Bitmap?>(null)
     internal val qrCode = _qrCode.asStateFlow()
-    private val subscriptions: MutableList<SubscriptionCache> =
-        MmkvManager.decodeSubscriptions().toMutableList()
+    private val _state = MutableStateFlow(SubscriptionListState())
+    internal val state = _state.asStateFlow()
 
-    private val _subsFlow = MutableStateFlow(subscriptions.toList())
-    val subsFlow: StateFlow<List<SubscriptionCache>> = _subsFlow.asStateFlow()
-
-    fun getAll(): List<SubscriptionCache> = subscriptions.toList()
-
-    fun reload() {
-        subscriptions.clear()
-        subscriptions.addAll(MmkvManager.decodeSubscriptions())
-        _subsFlow.value = subscriptions.toList()
+    // An onResume reload must not publish an older list over a move, toggle or deletion.
+    private val storage = Mutex()
+    private fun withStorage(operation: String, block: () -> Unit) = viewModelScope.launch {
+        try {
+            storage.withLock { withContext(Dispatchers.IO) { block() } }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (e: Exception) {
+            LogUtil.e(AppConfig.TAG, "Subscription list: $operation failed", e)
+            toastError(R.string.toast_failure)
+        }
     }
 
-    fun remove(subId: String): Boolean {
-        val changed = subscriptions.removeAll { it.guid == subId }
-        if (changed) {
-            SettingsManager.removeSubscriptionWithDefault(subId)
-            SettingsChangeManager.makeSetupGroupTab()
-        }
-        _subsFlow.value = subscriptions.toList()
-        return changed
+    fun reload() = withStorage("reload") {
+        _state.value = SubscriptionListState(
+            groups = MmkvManager.decodeSubscriptions(),
+            updateOptions = SubscriptionUpdateOption.entries.filterTo(mutableSetOf()) { MmkvManager.decodeSettingsBool(it.key, false) },
+            confirmRemove = MmkvManager.decodeSettingsBool(AppConfig.PREF_CONFIRM_REMOVE, false)
+        )
     }
 
-    fun update(subId: String, item: SubscriptionItem) {
-        val idx = subscriptions.indexOfFirst { it.guid == subId }
-        if (idx >= 0) {
-            subscriptions[idx] = SubscriptionCache(subId, item)
-            MmkvManager.encodeSubscription(subId, item)
-        }
-        _subsFlow.value = subscriptions.toList()
+    internal fun setOption(option: SubscriptionUpdateOption, enabled: Boolean) = withStorage("set update option") {
+        check(MmkvManager.encodeSettings(option.key, enabled))
+        val options = _state.value.updateOptions
+        _state.value = _state.value.copy(updateOptions = if (enabled) options + option else options - option)
+    }
+
+    private fun refreshGroups() {
+        _state.value = _state.value.copy(groups = MmkvManager.decodeSubscriptions())
+    }
+
+    fun remove(subId: String) = withStorage("remove group") {
+        if (MmkvManager.decodeSubscription(subId) == null) return@withStorage
+        SettingsManager.removeSubscriptionWithDefault(subId)
+        SettingsChangeManager.makeSetupGroupTab()
+        refreshGroups()
+    }
+
+    fun setEnabled(subId: String, enabled: Boolean) = withStorage("toggle group") {
+        val current = MmkvManager.decodeSubscription(subId) ?: return@withStorage
+        MmkvManager.encodeSubscription(subId, current.copy(enabled = enabled))
+        refreshGroups()
     }
 
     internal fun shareQRCode(url: String) {
@@ -78,27 +98,26 @@ class SubscriptionsViewModel(application: Application) : BaseViewModel(applicati
         _qrCode.value = null
     }
 
-    fun move(fromPosition: Int, toPosition: Int) {
-        if (subscriptions.moveItem(fromPosition, toPosition)) {
-            MmkvManager.encodeSubsList(subscriptions.mapTo(mutableListOf()) { it.guid })
+    fun move(fromId: String, toId: String) = withStorage("move group") {
+        val ids = MmkvManager.decodeSubsList()
+        if (ids.moveGuid(fromId, toId)) {
+            MmkvManager.encodeSubsList(ids)
             SettingsChangeManager.makeSetupGroupTab()
-            _subsFlow.value = subscriptions.toList()
+            refreshGroups()
         }
     }
 
     fun updateSubscriptions() {
-        val updateSubscription = MmkvManager.decodeSettingsBool(AppConfig.PREF_UPDATE_SUBSCRIPTION, false)
-        val autoTestAfterUpdateSubscription = MmkvManager.decodeSettingsBool(AppConfig.PREF_AUTO_TEST_AFTER_UPDATE_SUBSCRIPTION, false)
-
-        when {
-            // If auto test is enabled, trigger background service for long-running task
-            autoTestAfterUpdateSubscription -> updateSubscriptionsMore()
-            // If only update is enabled, perform local update with UI loading state
-            updateSubscription -> updateSubscriptionsOnly()
+        viewModelScope.launch {
+            val enabled = storage.withLock { _state.value.updateOptions }
+            when {
+                SubscriptionUpdateOption.Test in enabled -> updateSubscriptionsMore()
+                SubscriptionUpdateOption.Update in enabled -> updateSubscriptionsOnly()
+            }
         }
     }
 
-    fun updateSubscriptionsOnly() {
+    private fun updateSubscriptionsOnly() {
         launchLoading {
             try {
                 val result = withContext(Dispatchers.IO) {
@@ -134,9 +153,9 @@ class SubscriptionsViewModel(application: Application) : BaseViewModel(applicati
         }
     }
 
-    fun updateSubscriptionsMore() {
+    private suspend fun updateSubscriptionsMore() {
         SettingsChangeManager.makeSetupGroupTab()
-        val subIds = MmkvManager.decodeSubscriptions()
+        val subIds = withContext(Dispatchers.IO) { MmkvManager.decodeSubscriptions() }
             .filter { it.subscription.enabled && it.subscription.url.isNotEmpty() }
             .map { it.guid }
 

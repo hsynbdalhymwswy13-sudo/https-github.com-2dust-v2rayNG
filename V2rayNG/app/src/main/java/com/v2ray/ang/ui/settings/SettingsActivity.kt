@@ -42,6 +42,7 @@ import com.v2ray.ang.handler.MmkvManager.rememberMmkvString
 import com.v2ray.ang.handler.SettingsChangeManager
 import com.v2ray.ang.root.RootManager
 import com.v2ray.ang.ui.base.BaseComponentActivity
+import com.v2ray.ang.ui.apppicker.AppPickerActivity
 import com.v2ray.ang.ui.compose.AppTopBar
 import com.v2ray.ang.ui.compose.NavigationBarsSpacer
 import com.v2ray.ang.ui.compose.ThemeManager
@@ -98,7 +99,12 @@ abstract class BaseSettingsActivity : BaseComponentActivity() {
                 rows = rows,
                 viewModel = viewModel,
                 onModeHelpClicked = { Utils.openUri(this, AppConfig.APP_WIKI_MODE) },
-                onSystemVpnSettingsClicked = ::openSystemVpnSettings
+                onSystemVpnSettingsClicked = ::openSystemVpnSettings,
+                onRemoteControlClicked = {
+                    startActivity(AppPickerActivity.createIntent(
+                        this, title = getString(R.string.title_remote_control), remoteControl = true
+                    ))
+                }
             )
         }
     }
@@ -134,7 +140,8 @@ private fun SettingsForm(
     rows: SettingsRows,
     viewModel: SettingsViewModel,
     onModeHelpClicked: () -> Unit,
-    onSystemVpnSettingsClicked: () -> Unit
+    onSystemVpnSettingsClicked: () -> Unit,
+    onRemoteControlClicked: () -> Unit
 ) {
     val systemVpnSettingsAvailable by viewModel.systemVpnSettingsAvailable.collectAsStateWithLifecycle()
     var uiSettingsExpanded by rememberSaveable { mutableStateOf(true) }
@@ -656,6 +663,11 @@ private fun SettingsForm(
                 onExpandedChange = { advancedSettingsExpanded = it }
             )
             if (advancedSettingsExpanded) {
+                SettingsMenuItem(
+                    title = stringResource(R.string.title_remote_control),
+                    subtitle = stringResource(R.string.summary_remote_control),
+                    onClick = onRemoteControlClicked
+                )
                 SettingsSwitchItem(
                     title = stringResource(R.string.title_pref_is_booted),
                     summary = stringResource(R.string.summary_pref_is_booted),

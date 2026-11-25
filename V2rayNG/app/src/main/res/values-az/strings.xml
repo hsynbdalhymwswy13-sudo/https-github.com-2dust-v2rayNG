@@ -577,8 +577,24 @@
     <string name="sub_info_unlimited">Limitsiz</string>
 
     <string name="action_exit">Çıxış</string>
+    <string name="action_save">Saxla</string>
+    <string name="action_add_subscription">Abunəlik əlavə et</string>
     <string name="action_back">Geri</string>
     <string name="action_more">Daha çox</string>
     <string name="action_clear">Təmizlə</string>
+    <string name="action_share">Paylaş</string>
+    <string name="action_info">Məlumat</string>
+    <string name="action_remove">Çıxar</string>
+    <string name="action_add_member">Üzv əlavə et</string>
+    <string name="action_start_scan">Skaneri başlat</string>
+    <string name="action_stop_scan">Skaneri dayandır</string>
+    <string name="action_torch">Fənər</string>
+    <string name="action_select_image">Şəkil seç</string>
+    <string name="menu_item_edit_asset">Resursa düzəliş et</string>
+    <string name="menu_item_del_asset">Resursu sil</string>
+    <string name="logcat_update">Yenilə</string>
+    <string name="sub_setting_no_proxy">Heç biri</string>
+    <string name="routing_settings_enable_rule">Qaydanı aktivləşdir</string>
     <string name="connection_connected_tv">Qoşuldu</string>
+    <string name="server_proxy_chain_member">Üzv</string>
 </resources>

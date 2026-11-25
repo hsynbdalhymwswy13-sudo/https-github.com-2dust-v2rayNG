@@ -74,10 +74,10 @@ internal class DpadReorderState {
 
     fun isMoving(key: Any): Boolean = isMoving && activeKey == key
 
-    fun syncItems(keys: List<*>) {
+    fun syncItems(keys: Collection<*>, enabled: Boolean = true) {
         val key = activeKey ?: return
-        val index = keys.indexOf(key)
-        if (index < 0) {
+        val index = keys.indexOfFirst { it == key }
+        if (!enabled || index < 0) {
             reset()
         } else {
             movingIndex = index
@@ -249,11 +249,18 @@ internal class DpadReorderItem(
 )
 
 @Composable
+private fun rememberDpadReorderState(key: Any? = Unit): DpadReorderState =
+    remember(key) { DpadReorderState() }
+
+@Composable
 internal fun rememberSyncedDpadReorderState(
     keys: List<*>,
+    enabled: Boolean = true,
+    stateKey: Any? = Unit,
     onMovingItem: suspend (key: Any, index: Int) -> Unit
 ): DpadReorderState {
-    val state = remember { DpadReorderState() }
+    val state = rememberDpadReorderState(stateKey)
+    if (!isTelevisionDevice()) return state
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(state, lifecycleOwner) {
         // Row focus can move transiently while an item is reordered. End the interaction only
@@ -267,8 +274,8 @@ internal fun rememberSyncedDpadReorderState(
             state.cancelInteraction()
         }
     }
-    LaunchedEffect(state, keys) {
-        state.syncItems(keys)
+    LaunchedEffect(state, enabled, keys) {
+        state.syncItems(keys, enabled)
     }
     LaunchedEffect(state.movingKey, state.movingIndex) {
         val movingKey = state.movingKey ?: return@LaunchedEffect
@@ -302,6 +309,16 @@ internal fun twoColumnDpadReorderTarget(
         isRtl && index % 2 == 1 -> index - 1
         !isRtl && index % 2 == 0 -> index + 1
         else -> index
+    }
+}
+
+internal fun <T> reorderIndicesForKeys(keys: List<T>, fromKey: Any?, toKey: Any?): Pair<Int, Int>? {
+    val fromIndex = keys.indexOfFirst { it == fromKey }
+    val toIndex = keys.indexOfFirst { it == toKey }
+    return if (fromIndex >= 0 && toIndex >= 0 && fromIndex != toIndex) {
+        fromIndex to toIndex
+    } else {
+        null
     }
 }
 
@@ -364,9 +381,13 @@ private class LongPressTimer(var job: Job? = null)
 
 @Composable
 internal fun Modifier.dpadLongPressToMove(
+    enabled: Boolean = true,
     item: DpadReorderItem,
-    onClick: () -> Unit
+    onClick: () -> Unit,
+    addFocusTarget: Boolean = true
 ): Modifier {
+    if (!enabled) return this
+
     val coroutineScope = rememberCoroutineScope()
     val repeatReleaseGuardMillis = remember {
         dpadRepeatReleaseGuardMillis(ViewConfiguration.getKeyRepeatDelay())
@@ -509,5 +530,5 @@ internal fun Modifier.dpadLongPressToMove(
             }
         }
 
-    return movementModifier.focusable()
+    return if (addFocusTarget) movementModifier.focusable() else movementModifier
 }

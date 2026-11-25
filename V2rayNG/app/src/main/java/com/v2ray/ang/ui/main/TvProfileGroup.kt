@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
@@ -19,6 +20,7 @@ import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.platform.LocalWindowInfo
 import androidx.compose.ui.res.painterResource
@@ -78,6 +80,7 @@ internal fun TvProfileGroup(
     revealGeneration: Int,
     lastReveals: MutableMap<String, ProfileReveal>,
     onOpenDrawer: (TvMainFocusTarget.Profile) -> Unit,
+    onSearchFocus: ((TvMainFocusTarget.DrawerOrigin) -> Unit)?,
     onBackToToolbar: () -> Unit,
     onUpFromFirstRow: (() -> Boolean)?
 ) {
@@ -141,7 +144,16 @@ internal fun TvProfileGroup(
         { index, direction -> twoColumnDpadReorderTarget(index, direction, isRtl) }
     } else ::verticalDpadReorderTarget
 
-    val refreshFocus = if (group.usageInfo != null) remember { FocusRequester() } else null
+    // Only rendered header actions have a requester: a subscription can stop publishing either link.
+    val headerButtons = remember(group.id) { mutableMapOf<SubscriptionHeaderAction, FocusRequester>() }
+    if (focusToRestore is TvMainFocusTarget.Header) {
+        val window = LocalWindowInfo.current
+        LaunchedEffect(focusToRestore) {
+            snapshotFlow { window.isWindowFocused }.first { it }
+            val target = headerButtons[focusToRestore.action].takeIf { group.id == focusToRestore.groupId }
+            onFocusRestored(focusToRestore, target?.requestFocus() == true)
+        }
+    }
     val headerModifier = Modifier
         .dpadVerticalFocusNavigation(onMoveUp = { onUpFromFirstRow?.invoke() ?: false }, onMoveDown = { false })
         .dpadBackNavigation(onBack = onBackToToolbar)
@@ -150,8 +162,14 @@ internal fun TvProfileGroup(
         contentPadding = PaddingValues(start = 48.dp, top = 16.dp, end = 48.dp, bottom = 80.dp),
         onAction = onAction,
         headerModifier = headerModifier,
-        actionButton = { icon, label, isRefresh, click ->
-            TvIconButton(painterResource(icon), label, click, focusRequester = refreshFocus.takeIf { isRefresh })
+        actionButton = { icon, action, click ->
+            val requester = remember { FocusRequester() }
+            DisposableEffect(headerButtons, action) {
+                headerButtons[action] = requester
+                onDispose { headerButtons.remove(action) }
+            }
+            TvIconButton(painterResource(icon), stringResource(action.label), click, focusRequester = requester,
+                modifier = Modifier.onFocusChanged { if (it.isFocused) onSearchFocus?.invoke(TvMainFocusTarget.Header(group.id, action)) })
         }
     ) { padding ->
         TvProfileCollection(
@@ -172,6 +190,7 @@ internal fun TvProfileGroup(
             val renderRow = @Composable {
                 TvProfileRow(
                     row = row,
+                    onSearchFocus = onSearchFocus,
                     selected = row.guid == uiState.selectedGuid,
                     current = targets.getValue(row.guid),
                     above = targetAt(index - stride),
@@ -183,7 +202,7 @@ internal fun TvProfileGroup(
                         if (previousColumn != null) requestFocus(previousColumn) else onOpenDrawer(TvMainFocusTarget.Profile(row.guid))
                     },
                     onUpFromFirstRow = {
-                        if (refreshFocus != null) refreshFocus.requestFocus() else onUpFromFirstRow?.invoke() ?: false
+                        headerButtons[SubscriptionHeaderAction.Refresh]?.requestFocus() ?: onUpFromFirstRow?.invoke() ?: false
                     },
                     onBackToToolbar = onBackToToolbar,
                     reorderItem = reorderItem,
@@ -227,6 +246,7 @@ private fun RevealSelectedProfile(
 @Composable
 private fun TvProfileRow(
     row: ServerRowUiModel,
+    onSearchFocus: ((TvMainFocusTarget.Profile) -> Unit)?,
     selected: Boolean,
     current: ProfileRowFocus,
     above: ProfileRowFocus?,
@@ -243,7 +263,10 @@ private fun TvProfileRow(
     val moving = reorderItem?.let { it.state.isMoving(row.guid) } == true
     val decoration = Modifier.dpadFocusOutline(focusRequester = current.row, showFocus = !moving)
         .dpadBackNavigation(enabled = !moving, onBack = onBackToToolbar)
-    val interaction = Modifier
+    fun searchTarget(action: ProfileRowAction? = null) = if (onSearchFocus == null) Modifier else Modifier.onFocusChanged {
+        if (it.isFocused) onSearchFocus(TvMainFocusTarget.Profile(row.guid, action))
+    }
+    val interaction = searchTarget()
         .dpadOrderedFocusNavigation(current.row, current.order, onBeforeFirst = onPrevious)
         .dpadVerticalFocusNavigation(
             onMoveUp = { above?.row?.let(requestFocus) ?: onUpFromFirstRow() },
@@ -270,7 +293,7 @@ private fun TvProfileRow(
                     )
                     TvIconButton(
                         painterResource(action.icon), stringResource(action.label), { onAction(action) },
-                        modifier = navigation, focusRequester = target, contentDescription = stringResource(action.description)
+                        modifier = searchTarget(action).then(navigation), focusRequester = target, contentDescription = stringResource(action.description)
                     )
                 }
             }

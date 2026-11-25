@@ -24,6 +24,8 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.input.InputMode
+import androidx.compose.ui.platform.LocalInputModeManager
 import androidx.compose.ui.platform.LocalWindowInfo
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
@@ -47,14 +49,20 @@ internal sealed interface TvMainFocusTarget {
                     when (target) {
                         null -> emptyList()
                         Toolbar -> listOf("toolbar")
+                        SearchInput -> listOf("input")
+                        SearchClear -> listOf("clear")
                         is GroupTab -> listOf("tab", target.id)
+                        is Header -> listOf("header", target.groupId, target.action.name)
                         is Profile -> listOf("profile", target.guid, target.action?.name.orEmpty())
                     }
                 },
                 restore = {
                     when (it[0]) {
                         "toolbar" -> Toolbar
+                        "input" -> SearchInput
+                        "clear" -> SearchClear
                         "tab" -> GroupTab(it[1])
+                        "header" -> Header(it[1], SubscriptionHeaderAction.valueOf(it[2]))
                         "profile" -> Profile(it[1], it[2].takeIf(String::isNotEmpty)?.let(ProfileRowAction::valueOf))
                         else -> null
                     }
@@ -64,7 +72,10 @@ internal sealed interface TvMainFocusTarget {
     }
 
     data object Toolbar : DrawerOrigin
+    data object SearchInput : DrawerOrigin
+    data object SearchClear : DrawerOrigin
     data class GroupTab(val id: String) : DrawerOrigin
+    data class Header(val groupId: String, val action: SubscriptionHeaderAction) : DrawerOrigin
     data class Profile(val guid: String, val action: ProfileRowAction? = null) : DrawerOrigin {
         companion object {
             val Saver = listSaver<Profile?, String>(
@@ -103,7 +114,19 @@ internal fun TvMainScreen(
     var drawerOrigin by rememberSaveable(stateSaver = TvMainFocusTarget.DrawerOrigin.Saver) {
         mutableStateOf<TvMainFocusTarget.DrawerOrigin?>(null)
     }
-    var focusToRestore by remember { mutableStateOf<TvMainFocusTarget?>(null) }
+    var searchTarget by rememberSaveable(stateSaver = TvMainFocusTarget.DrawerOrigin.Saver) {
+        mutableStateOf<TvMainFocusTarget.DrawerOrigin?>(null)
+    }
+    val inputMode = LocalInputModeManager.current
+    var searchUsedDpad by rememberSaveable { mutableStateOf(false) }
+    fun recordSearchFocus(target: TvMainFocusTarget.DrawerOrigin) {
+        searchTarget = target
+        searchUsedDpad = inputMode.inputMode == InputMode.Keyboard
+    }
+    var focusToRestore by remember { mutableStateOf<TvMainFocusTarget?>(searchTarget.takeUnless { isDrawerOpen }) }
+    LaunchedEffect(Unit) {
+        if (focusToRestore != null && searchUsedDpad) inputMode.requestInputMode(InputMode.Keyboard)
+    }
     fun openDrawer(origin: TvMainFocusTarget.DrawerOrigin) {
         drawerOrigin = origin
         drawerState.setValue(TvDrawerValue.Open)
@@ -111,6 +134,7 @@ internal fun TvMainScreen(
     var showSearch by rememberSaveable { mutableStateOf(uiState.searchQuery.isNotEmpty()) }
     fun closeSearch() {
         onAction(MainAction.Search(""))
+        searchTarget = null
         showSearch = false
     }
 
@@ -167,10 +191,15 @@ internal fun TvMainScreen(
     val latestTabFocus by rememberUpdatedState(::focusGroupTab)
     LaunchedEffect(isDrawerOpen, focusToRestore) {
         val target = focusToRestore ?: return@LaunchedEffect
-        if (isDrawerOpen || target is TvMainFocusTarget.Profile || target is TvMainFocusTarget.AfterRemoval) return@LaunchedEffect
+        if (isDrawerOpen || target is TvMainFocusTarget.Profile || target is TvMainFocusTarget.Header || target is TvMainFocusTarget.AfterRemoval) return@LaunchedEffect
         snapshotFlow { windowInfo.isWindowFocused }.first { it }
         withFrameNanos { }
-        if (target !is TvMainFocusTarget.GroupTab || !latestTabFocus(target.id)) requestFocusWhenReady(topBarFocus.start)
+        when (target) {
+            TvMainFocusTarget.SearchInput -> requestFocusWhenReady(topBarFocus.searchInput)
+            TvMainFocusTarget.SearchClear -> requestFocusWhenReady(topBarFocus.searchClear)
+            is TvMainFocusTarget.GroupTab -> if (!latestTabFocus(target.id)) requestFocusWhenReady(topBarFocus.start)
+            else -> requestFocusWhenReady(topBarFocus.start)
+        }
         focusToRestore = null
     }
 
@@ -194,6 +223,7 @@ internal fun TvMainScreen(
                         isLoading = isLoading,
                         isRunning = uiState.isRunning,
                         showSearch = showSearch,
+                        onSearchFocus = ::recordSearchFocus,
                         searchQuery = uiState.searchQuery,
                         focusRequesters = topBarFocus,
                         onSearchQueryChange = { onAction(MainAction.Search(it)) },
@@ -219,6 +249,7 @@ internal fun TvMainScreen(
                         if (tabState != null && requestTabFocus != null) {
                             TvGroupTabBar(
                                 groups, mainViewModel, selectedGroupIndex, tabState, tabOrder, requestTabFocus,
+                                onSearchFocus = if (showSearch) { id -> recordSearchFocus(TvMainFocusTarget.GroupTab(id)) } else null,
                                 onOpenDrawer = { id -> openDrawer(TvMainFocusTarget.GroupTab(id)) },
                                 onMoveUp = { topBarFocus.start.requestFocus() },
                                 onSelectGroup = { onAction(MainAction.SelectGroup(it)) }
@@ -242,6 +273,7 @@ internal fun TvMainScreen(
                                 dialogs = dialogs,
                                 revealGeneration = profileRevealGeneration,
                                 lastReveals = lastReveals,
+                                onSearchFocus = if (showSearch) ::recordSearchFocus else null,
                                 onOpenDrawer = ::openDrawer,
                                 onBackToToolbar = { topBarFocus.start.requestFocus() },
                                 onUpFromFirstRow = if (tabState != null) { { focusGroupTab(selectedGroup.id) } } else null

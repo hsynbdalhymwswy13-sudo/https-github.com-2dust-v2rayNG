@@ -26,8 +26,11 @@ import com.v2ray.ang.util.LogUtil
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
@@ -78,12 +81,12 @@ private fun applyTestDelayResultsToRows(
 class MainViewModel(
     application: Application,
     private val dataSource: MainDataSource,
-    private val savedStateHandle: SavedStateHandle
+    private val savedStateHandle: SavedStateHandle,
+    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+    private val defaultDispatcher: CoroutineDispatcher = Dispatchers.Default,
 ) : BaseViewModel(application) {
 
-    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO
-    private val defaultDispatcher: CoroutineDispatcher = Dispatchers.Default
-    private val preloadDispatcher: CoroutineDispatcher = Dispatchers.IO.limitedParallelism(1)
+    private val preloadDispatcher: CoroutineDispatcher = ioDispatcher.limitedParallelism(1)
 
     // ---------- UI state ----------
     private val _uiState = MutableStateFlow(
@@ -105,7 +108,6 @@ class MainViewModel(
     private val groupDataCache = mutableMapOf<String, List<ServersCache>>()
     private val groupUiFlows = ConcurrentHashMap<String, MutableStateFlow<ServerGroupUiState>>()
     private val groupServerFlows = ConcurrentHashMap<String, StateFlow<List<ServersCache>>>()
-    private val groupLoadMutexes = ConcurrentHashMap<String, Mutex>()
     private val serverOrderPersistenceJobs = mutableMapOf<String, Job>()
 
     private var setupGroupJob: Job? = null
@@ -373,14 +375,26 @@ class MainViewModel(
         groupId: String,
         forceRefresh: Boolean = false
     ): List<ServersCache> {
-        val loadMutex = groupLoadMutexes.computeIfAbsent(groupId) { Mutex() }
-        return loadMutex.withLock {
+        // Keep cache lookup, refresh and publication together: an older in-flight load must
+        // not repopulate an aggregate/shared-profile cache after it was invalidated.
+        return cacheMutex.withLock {
             if (!forceRefresh) {
-                cacheMutex.withLock { groupDataCache[groupId]?.let { return@withLock it } }
+                groupDataCache[groupId]?.let { return@withLock it }
             }
             val servers = buildServersCache(dataSource.getServerGuidList(groupId))
             currentCoroutineContext().ensureActive()
-            cacheMutex.withLock { groupDataCache[groupId] = servers }
+            if (forceRefresh) {
+                if (groupId.isEmpty()) {
+                    groupDataCache.clear()
+                } else {
+                    // The All tab contains every group. Other groups can share profile GUIDs.
+                    val affectedIds = (groupDataCache[groupId].orEmpty() + servers).mapTo(HashSet()) { it.guid }
+                    groupDataCache.entries.removeAll { (id, cached) ->
+                        id != groupId && (id.isEmpty() || cached.any { it.guid in affectedIds })
+                    }
+                }
+            }
+            groupDataCache[groupId] = servers
             servers
         }
     }
@@ -402,9 +416,13 @@ class MainViewModel(
     }
 
     private fun updateGroupUi(groupId: String, servers: List<ServersCache>) {
+        mutableServerGroupState(groupId).value = buildGroupUiState(groupId, servers)
+    }
+
+    private fun buildGroupUiState(groupId: String, servers: List<ServersCache>): ServerGroupUiState {
         val keyword = uiState.value.searchQuery.trim()
         val filteredServers = applyKeywordFilter(servers, keyword)
-        mutableServerGroupState(groupId).value = ServerGroupUiState(
+        return ServerGroupUiState(
             servers = filteredServers,
             rows = buildServerRows(groupId, filteredServers),
             isFiltered = keyword.isNotEmpty()
@@ -479,7 +497,6 @@ class MainViewModel(
                 val validIds = groups.mapTo(HashSet()) { it.id }
                 groupUiFlows.keys.removeAll { it !in validIds }
                 groupServerFlows.keys.removeAll { it !in validIds }
-                groupLoadMutexes.keys.removeAll { it !in validIds }
 
                 _uiState.update {
                     it.copy(
@@ -627,13 +644,9 @@ class MainViewModel(
                             dataSource.removeAllServer()
                         } else {
                             val guids = currentServers().map { it.guid }
-                            guids.forEach { dataSource.removeServer(it) }
-                            guids.size
+                            guids.count { dataSource.removeServer(it) }
                         }
-                    viewModelScope.launch(ioDispatcher) {
-                        cacheMutex.withLock { groupDataCache.clear() }
-                    }
-                    setupGroupTab(forceRefresh = true)
+                    setupGroupTab(forceRefresh = true).join()
                     toast(dataSource.getString(R.string.title_del_config_count, count))
                 } catch (cancelled: CancellationException) {
                     throw cancelled
@@ -658,9 +671,13 @@ class MainViewModel(
                             if (!seen.add(identity)) duplicates += server.guid
                         }
                     }
-                    duplicates.forEach { dataSource.removeServer(it) }
-                    setupGroupTab(forceRefresh = true)
-                    toast(dataSource.getString(R.string.title_del_duplicate_config_count, duplicates.size))
+                    val removedCount = duplicates.count { dataSource.removeServer(it) }
+                    setupGroupTab(forceRefresh = true).join()
+                    if (removedCount == duplicates.size) {
+                        toast(dataSource.getString(R.string.title_del_duplicate_config_count, removedCount))
+                    } else {
+                        toastError(R.string.toast_failure)
+                    }
                 } catch (cancelled: CancellationException) {
                     throw cancelled
                 } catch (e: Exception) {
@@ -676,10 +693,7 @@ class MainViewModel(
             withContext(ioDispatcher) {
                 try {
                     val count = removeInvalidServerInternal()
-                    viewModelScope.launch(ioDispatcher) {
-                        cacheMutex.withLock { groupDataCache.clear() }
-                        setupGroupTab(forceRefresh = true)
-                    }
+                    setupGroupTab(forceRefresh = true).join()
                     toast(dataSource.getString(R.string.title_del_config_count, count))
                 } catch (cancelled: CancellationException) {
                     throw cancelled
@@ -708,8 +722,7 @@ class MainViewModel(
             withContext(ioDispatcher) {
                 try {
                     sortByTestResultsInternal()
-                    cacheMutex.withLock { groupDataCache.clear() }
-                    setupGroupTab(forceRefresh = true)
+                    setupGroupTab(forceRefresh = true).join()
                 } catch (cancelled: CancellationException) {
                     throw cancelled
                 } catch (e: Exception) {
@@ -736,10 +749,16 @@ class MainViewModel(
             dataSource.setSelectedSubscriptionId(id)
             _uiState.update { it.copy(selectedGroupId = id) }
         }
+        loadSelectedGroup(id)
+    }
+
+    private fun loadSelectedGroup(id: String) {
         selectedGroupLoadJob?.cancel()
         selectedGroupLoadJob = viewModelScope.launch(ioDispatcher) {
             try {
-                updateGroupUi(id, loadGroup(id))
+                val servers = loadGroup(id)
+                ensureActive()
+                updateGroupUi(id, servers)
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Exception) {
@@ -795,32 +814,27 @@ class MainViewModel(
             return
         }
         viewModelScope.launch(ioDispatcher) {
-            dataSource.removeServer(guid)
-            cacheMutex.withLock { groupDataCache.clear() }
+            if (!dataSource.removeServer(guid)) {
+                toastError(R.string.toast_failure)
+                return@launch
+            }
             setupGroupTab(forceRefresh = true).join()
         }
     }
 
-    private fun moveServer(action: MainAction.MoveServer) {
+    internal fun moveServer(action: MainAction.MoveServer): Deferred<Boolean>? {
         val groupId = action.groupId
-        val groupFlow = groupUiFlows[groupId] ?: return
+        val groupFlow = groupUiFlows[groupId] ?: return null
         val current = groupFlow.value
-        if (!current.canReorder(groupId, uiState.value.searchQuery)) return
-        groupFlow.value = current.moveServer(action.fromGuid, action.toGuid) ?: return
-        // Keep immediate D-pad feedback, but apply queued moves by GUID to the stored index.
+        if (!current.canReorder(groupId, uiState.value.searchQuery)) return null
+        groupFlow.value = current.moveServer(action.fromGuid, action.toGuid) ?: return null
+        // Update the visible list immediately and apply queued moves to the stored index by GUID.
         val previousPersistenceJob = serverOrderPersistenceJobs[groupId]
-        serverOrderPersistenceJobs[groupId] = viewModelScope.launch {
+        val write = viewModelScope.async(start = CoroutineStart.LAZY) {
             previousPersistenceJob?.join()
             val saved = withContext(ioDispatcher) {
                 try {
-                    val order = dataSource.moveServerInGroup(groupId, action.fromGuid, action.toGuid)
-                    cacheMutex.withLock {
-                        val cached = groupDataCache.remove(groupId)?.associateBy { it.guid }
-                        if (order != null && cached != null && order.size == cached.size && order.all(cached::containsKey)) {
-                            groupDataCache[groupId] = order.map(cached::getValue)
-                        }
-                    }
-                    order != null
+                    dataSource.moveServerInGroup(groupId, action.fromGuid, action.toGuid) != null
                 } catch (cancelled: CancellationException) {
                     throw cancelled
                 } catch (error: Exception) {
@@ -828,11 +842,33 @@ class MainViewModel(
                     false
                 }
             }
-            if (serverOrderPersistenceJobs[groupId] == coroutineContext[Job]) {
-                serverOrderPersistenceJobs.remove(groupId)
-                if (!saved) setupGroupTab(forceRefresh = true)
+            if (!saved) toastError(R.string.toast_failure)
+
+            // Only the last queued move publishes the current persisted membership and order.
+            val thisJob = currentCoroutineContext()[Job]
+            if (serverOrderPersistenceJobs[groupId] === thisJob) {
+                try {
+                    val persisted = withContext(ioDispatcher) {
+                        buildGroupUiState(groupId, loadGroup(groupId, forceRefresh = true))
+                    }
+                    if (serverOrderPersistenceJobs[groupId] === thisJob) {
+                        groupFlow.value = persisted
+                        // All may have been selected while the move was being saved.
+                        if (uiState.value.selectedGroupId.isEmpty()) loadSelectedGroup("")
+                    }
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (error: Exception) {
+                    LogUtil.e(AppConfig.TAG, "Failed to reload profile order for group: $groupId", error)
+                } finally {
+                    if (serverOrderPersistenceJobs[groupId] === thisJob) serverOrderPersistenceJobs.remove(groupId)
+                }
             }
+            saved
         }
+        serverOrderPersistenceJobs[groupId] = write
+        write.start()
+        return write
     }
 
     // ---------- Testing ----------

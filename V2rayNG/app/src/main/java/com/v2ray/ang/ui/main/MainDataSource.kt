@@ -34,7 +34,7 @@ interface MainDataSource : Closeable {
 
     fun moveServerInGroup(groupId: String, fromGuid: String, toGuid: String): List<String>?
 
-    fun removeServer(guid: String)
+    fun removeServer(guid: String): Boolean
     fun removeAllServer(): Int
     fun removeInvalidServerByGuid(guid: String): Int
     fun removeInvalidServersInGroup(groupId: String): Int
